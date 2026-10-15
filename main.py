@@ -182,6 +182,7 @@ button:hover{filter:brightness(1.08)}
     </div>
     <div class="emoji" id="emoji"></div>
     <div id="status"></div>
+    <div id="net" style="font-size:12px;color:var(--muted)"></div>
     <div class="row" style="align-items:center"><span id="role" style="flex:1;font-size:13px;color:var(--muted)"></span><button class="ghost" id="openBtn" onclick="toggleOpen()" hidden style="padding:6px 12px;font-size:13px"></button></div>
     <h3>Up next</h3>
     <div id="queue"></div>
@@ -300,12 +301,24 @@ function loadPreset() { const v = $('preset').value; if (v && canControl()) star
 let cid = '';
 try { cid = sessionStorage.getItem('wp_cid') || ''; } catch {}
 if (!cid) { cid = Math.random().toString(36).slice(2, 12); try { sessionStorage.setItem('wp_cid', cid); } catch {} }
-socket.on('connect', () => socket.emit('join_room', { room, cid }));
+let wasDown = false;
+socket.on('connect', () => {
+  socket.emit('join_room', { room, cid });
+  if (wasDown) { wasDown = false; say('Reconnected and re-synced.'); }
+});
+socket.on('disconnect', () => {
+  wasDown = true;
+  say('Connection lost. Reconnecting; the room will re-sync automatically.', true);
+  if (localStream) leaveCall();
+});
 socket.on('state', s => { applyState(s); myVote = s.mine ?? null; renderPoll(s.votes); lastQueue = s.queue || []; applyPerms(s); });
 socket.on('sync_media', d => {
   if (!ready) return;
   lock();
-  if (!isLive() && Math.abs(player.getCurrentTime() - d.time) > 1) player.seekTo(d.time, true);
+  if (!isLive()) {
+    const exp = d.time + (d.action === 'play' ? rtt / 2000 : 0);  // allow for network delay
+    if (Math.abs(player.getCurrentTime() - exp) > 0.4) player.seekTo(exp, true);
+  }
   d.action === 'play' ? player.playVideo() : player.pauseVideo();
 });
 socket.on('sync_video', d => { if (ready) { lock(1800); player.loadVideoById(d.videoId); } });
@@ -464,6 +477,38 @@ socket.on('perms', applyPerms);
 socket.on('queue', renderQueue);
 applyPerms({ isHost: false, open: false });
 
+// ---------- Sync quality: ping, heartbeat, drift correction ----------
+let rtt = 0, lastDrift = null;
+function showNet() {
+  $('net').textContent = 'Ping ' + Math.round(rtt) + ' ms' + (lastDrift === null ? '' : ' | drift ' + Math.round(lastDrift * 1000) + ' ms');
+}
+function measureRtt() {
+  const t0 = performance.now();
+  socket.timeout(2000).emit('ping_check', err => {
+    if (err) return;
+    const m = performance.now() - t0;
+    rtt = rtt ? rtt * 0.7 + m * 0.3 : m;  // smoothed
+    showNet();
+  });
+}
+setInterval(measureRtt, 3000);
+socket.on('connect', measureRtt);
+
+// The host reports its position every 2 s. Everyone else corrects themselves if they are
+// more than 0.4 s away from the host (after allowing for half the round-trip time).
+setInterval(() => {
+  if (!ready || !isHost || remote || isLive() || player.getPlayerState() !== YT.PlayerState.PLAYING) return;
+  socket.emit('heartbeat', { room, time: player.getCurrentTime(), videoId: curId() });
+}, 2000);
+socket.on('sync_tick', d => {
+  if (!ready || isHost || isLive() || d.videoId !== curId()) return;
+  if (player.getPlayerState() !== YT.PlayerState.PLAYING) return;
+  const expected = d.time + rtt / 2000;
+  lastDrift = player.getCurrentTime() - expected;
+  showNet();
+  if (Math.abs(lastDrift) > 0.4) { lock(); player.seekTo(expected, true); }
+});
+
 // ---------- Reactions ----------
 ['❤️', '🔥', '😂', '👏', '🍿'].forEach(e => {
   const b = document.createElement('button'); b.textContent = e;
@@ -576,6 +621,27 @@ async def submit_vote(sid, data):
             r["choices"][voter] = idx
             r["votes"][idx] += 1
     await sio.emit("update_poll", r["votes"], room=name)
+
+
+# ---------- Sync quality: ping + host heartbeat ----------
+@sio.event
+async def ping_check(sid, *args):
+    return True  # the return value is the acknowledgement; clients time the round trip
+
+
+@sio.event
+async def heartbeat(sid, data):
+    """The host reports its playback position every ~2 s so viewers can correct drift."""
+    name = room_of(data)
+    r = get_room(name)
+    if r["host"] is None or r["cids"].get(sid) != r["host"] or data.get("videoId") != r["video"]:
+        return
+    try:
+        t = float(data.get("time", 0))
+    except (TypeError, ValueError):
+        return
+    r.update(time=t, playing=True, at=time.time())
+    await sio.emit("sync_tick", {"time": t, "playing": True, "videoId": r["video"]}, room=name, skip_sid=sid)
 
 
 # ---------- Host controls and queue ----------
